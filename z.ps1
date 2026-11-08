@@ -1,5 +1,5 @@
 # GPU-only check for a used RTX 3090 (stability, thermals, throttling, driver errors). Run from an ADMINISTRATOR cmd:
-#   powershell "irm test.schlaug.com|iex"   (backup: powershell "irm https://is.gd/pcz440|iex"). No NVIDIA driver? It offers to install the latest Game Ready driver (~1 GB).
+#   powershell "irm test.schlaug.com|iex"   (backup: powershell "irm https://is.gd/pcz440|iex"). No NVIDIA driver? It installs the latest Game Ready driver automatically (~1 GB).
 # Full 24 GB VRAM test (memtest_vulkan, 0.6 MB) + compute load (llama.cpp Vulkan 38 MB + 1 GB model). ~9 min. Quick mode (0.5 GB model): set QUICK=1 first.
 $SelfUrl = 'https://raw.githubusercontent.com/solidfox/pc/main/z.ps1'
 $ErrorActionPreference = 'Continue'; $ProgressPreference = 'SilentlyContinue'
@@ -37,8 +37,8 @@ Step 'GPU info' {
     $nvdev=@(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | ? { $_.PNPDeviceID -like 'PCI\VEN_10DE*' -and ($_.PNPClass -eq 'Display' -or $_.Name -match 'VGA|Video|Display|NVIDIA|GeForce|3D') })
     if(-not $nvdev.Count){ V 'FAIL' 'No NVIDIA graphics card detected on the PCI bus (card missing, not seated, or not powered)'; throw 'no NVIDIA GPU detected' }
     "  NVIDIA card present ($($nvdev[0].Name)) but no NVIDIA driver installed."
-    $a=Read-Host '  Download (~1 GB) and silently install the latest NVIDIA Game Ready driver now? (y/N)'
-    if($a -notmatch '^(y|j)'){ throw 'nvidia-smi not found (NVIDIA driver missing; install declined)' }
+    if($env:NODRIVER -eq '1'){ throw 'nvidia-smi not found (NVIDIA driver missing; auto-install disabled by NODRIVER=1)' }
+    "  Installing the latest NVIDIA Game Ready driver automatically (~1 GB; works for OEM Dell/Alienware 3090s too)..." 
     $q='https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php?func=DriverManualLookup&psid=120&pfid=930&osID=57&languageCode=1033&beta=0&isWHQL=1&dltype=-1&dch=1&upCRD=0&qnf=0&sort1=0&numberOfResults=1'
     $di=(Invoke-RestMethod $q -Headers @{'User-Agent'='pccheck'}).IDS[0].downloadInfo
     if(-not $di.DownloadURL -or $di.DownloadURL -notmatch '^https://[a-z0-9\.]*nvidia\.com/'){ throw 'Could not look up the NVIDIA driver download' }
