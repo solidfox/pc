@@ -1,6 +1,6 @@
 # GPU-only check for a used RTX 3090 (stability, thermals, throttling, driver errors). Run from an ADMINISTRATOR cmd:
 #   powershell "irm https://is.gd/pcz440|iex"      (in PowerShell: irm https://is.gd/pcz440|iex)
-# Downloads ~1 GB (llama.cpp Vulkan build 38 MB + 1 GB model). Quick mode (0.5 GB model): set QUICK=1 first.
+# Full 24 GB VRAM test (memtest_vulkan, 0.6 MB) + compute load (llama.cpp Vulkan 38 MB + 1 GB model). ~9 min. Quick mode (0.5 GB model): set QUICK=1 first.
 $SelfUrl = 'https://raw.githubusercontent.com/solidfox/pc/main/z.ps1'
 $ErrorActionPreference = 'Continue'; $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
@@ -36,6 +36,19 @@ Step 'GPU info' {
   if($LASTEXITCODE -ne 0){ throw "nvidia-smi exit $LASTEXITCODE" }
   if($g[0] -match '3090'){ V 'PASS' $g[0].Trim() } else { V 'FAIL' "GPU is '$($g[0])', not a 3090" }
   $vr=Num $g[1]; if($vr -ge 24000){ V 'PASS' "$vr MiB VRAM" } else { V 'FAIL' "VRAM $vr MiB" }
+}
+
+$mtv=$null
+Step 'Download VRAM tester (memtest_vulkan)' {
+  if(-not $smi){ throw 'skipped: no nvidia-smi' }
+  $e=Join-Path $W 'memtest_vulkan.exe'
+  if(-not (Test-Path $e)){
+    $u='https://github.com/GpuZelenograd/memtest_vulkan/releases/download/v0.5.0/memtest_vulkan-v0.5.0.exe'
+    try { $r=Invoke-RestMethod 'https://api.github.com/repos/GpuZelenograd/memtest_vulkan/releases/latest' -Headers @{'User-Agent'='pccheck'}; $a=$r.assets|?{ $_.name -match '^memtest_vulkan-v[\d\.]+\.exe$' }|Select -First 1; if($a){ $u=$a.browser_download_url } } catch {}
+    & curl.exe -L --fail -s -S -o "$e.part" $u; if($LASTEXITCODE -ne 0){ Remove-Item "$e.part" -ErrorAction SilentlyContinue; throw 'memtest_vulkan download failed' }
+    Move-Item "$e.part" $e -Force
+  }
+  $script:mtv=$e; V 'PASS' 'VRAM tester ready'
 }
 
 $bench=$null; $model=$null
@@ -81,8 +94,8 @@ function RunBench($argList,$timeoutSec){
 
 $csv=Join-Path $W 'gpu-log.csv'; $mon=$null; $TestStart=$null; $cols=@()
 Remove-Item $csv -ErrorAction SilentlyContinue  # a stale log from an earlier run must not be summarised if the test is skipped
-Step 'GPU load test (about 6 minutes)' {
-  if(-not $bench -or -not $model){ throw 'skipped: benchmark tools unavailable (GPU info above still valid)' }
+Step 'GPU test: full VRAM (~5 min) then compute load (~3 min)' {
+  if(-not $mtv -and (-not $bench -or -not $model)){ throw 'skipped: test tools unavailable (GPU info above still valid)' }
   $fields='timestamp','temperature.gpu','utilization.gpu','power.draw','clocks.sm','fan.speed','memory.used','pcie.link.gen.current','pcie.link.width.current'
   $tr=$null; foreach($pre in 'clocks_event_reasons','clocks_throttle_reasons'){ & $smi -i 0 --query-gpu="$pre.active" --format=csv,noheader 2>$null | Out-Null; if($LASTEXITCODE -eq 0){ $tr=$pre; break } }
   $ok=@(); foreach($f in $fields){ & $smi -i 0 --query-gpu=$f --format=csv,noheader 2>$null | Out-Null; if($LASTEXITCODE -eq 0){ $ok+=$f } }
@@ -91,8 +104,29 @@ Step 'GPU load test (about 6 minutes)' {
   $script:TestStart=Get-Date
   $script:mon=Start-Process $smi -ArgumentList '-i','0',"--query-gpu=$($ok -join ',')",'--format=csv,noheader,nounits','-l','2' -RedirectStandardOutput $csv -PassThru -WindowStyle Hidden
   try {
+    if($mtv){
+      "  VRAM test: memtest_vulkan writes and checks nearly all 24 GB repeatedly (standard 5-minute run)..."
+      $mo=Join-Path $W 'mtv-out.txt'; Remove-Item $mo,(Join-Path $W 'memtest_vulkan.log') -ErrorAction SilentlyContinue
+      Get-Process memtest_vulkan* -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+      $mp=Start-Process $mtv -WorkingDirectory $W -RedirectStandardOutput $mo -RedirectStandardError "$mo.err" -PassThru -WindowStyle Hidden
+      $mEnd=(Get-Date).AddSeconds(420); $mt=''
+      while((Get-Date) -lt $mEnd){
+        Start-Sleep 10; $mt=(Get-Content $mo -Raw -ErrorAction SilentlyContinue) + (Get-Content (Join-Path $W 'memtest_vulkan.log') -Raw -ErrorAction SilentlyContinue)
+        if($mt -match 'Standard 5-minute test (PASSed|fail)' -or $mt -match 'testing finished|testing PASSed|INIT OR FIRST testing failed|runtime error occured'){ break }
+        if($mp.HasExited -and -not (Get-Process memtest_vulkan* -ErrorAction SilentlyContinue)){ break }
+      }
+      Get-Process memtest_vulkan* -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+      $sz=[regex]::Matches($mt,'Test memory size\s+([\d\.]+)GB') | Select -Last 1
+      $gb=if($sz){ Num $sz.Groups[1].Value }else{ $null }
+      if($gb){ "  Tested $gb GB of VRAM" }
+      ($mt -split "`n" | ? { $_ -match 'written:|Error found|Errors address|Standard 5-minute' } | Select -Last 4) | % { "    $($_.Trim())" }
+      if($mt -match 'ERRORS FOUND|Error found'){ V 'FAIL' 'VRAM errors found by memtest_vulkan (faulty memory or overheating VRAM)' }
+      elseif($mt -match 'Standard 5-minute test PASSed'){ if($gb -and $gb -lt 20){ V 'WARN' "VRAM test passed but covered only $gb GB" } else { V 'PASS' "VRAM test passed ($gb GB written and verified, no errors)" } }
+      else { [void]$Failures.Add("VRAM test: did not complete. Output tail: $((($mt -split "`n") | Select -Last 5) -join ' | ')"); V 'WARN' 'VRAM test did not complete (see output above)' }
+    }
+    if(-not $bench -or -not $model){ throw 'compute load skipped: llama.cpp tools unavailable' }
     "  Warm-up benchmark:"; RunBench @('-m',"`"$model`"",'-ngl','99','-p','512','-n','128','-r','3') 300 | Write-Host
-    $end=(Get-Date).AddMinutes(4)
+    $end=(Get-Date).AddMinutes(2)
     while((Get-Date) -lt $end){
       [void](RunBench @('-m',"`"$model`"",'-ngl','99','-p','4096','-n','0','-ub','2048','-r','30') 240)
       $last=Get-Content $csv -Tail 1 -ErrorAction SilentlyContinue
@@ -128,7 +162,7 @@ Step 'GPU load summary' {
 
 Hdr 'VERDICT'
 foreach($l in 'FAIL','WARN','PASS'){ $Verdicts | ? { $_.L -eq $l } | % { Write-Host "  [$l] $($_.M)" -ForegroundColor (@{PASS='Green';WARN='Yellow';FAIL='Red'}[$l]) } }
-"  Note: GPU-only check (RAM, disks and CPU not tested). Sustained GPU compute load, not a full VRAM memory test; core temp does not show GDDR6X memory temperature."
+"  Note: GPU-only check (RAM, disks and CPU not tested). Full VRAM write/verify (memtest_vulkan) plus sustained compute load; core temp does not show GDDR6X memory temperature."
 if($Failures.Count){ "`n  Checks that crashed:"; $Failures | % { "   - $_" } }
 try { Stop-Transcript | Out-Null } catch {}
 Write-Host "`nReport: $Log" -ForegroundColor Cyan
