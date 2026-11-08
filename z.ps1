@@ -1,6 +1,6 @@
-# Used-PC check for an RTX 3090 workstation. Run from an ADMINISTRATOR cmd:
+# GPU-only check for a used RTX 3090 (stability, thermals, throttling, driver errors). Run from an ADMINISTRATOR cmd:
 #   powershell "irm https://is.gd/pcz440|iex"      (in PowerShell: irm https://is.gd/pcz440|iex)
-# Quick mode (2 GB model instead of 4.7 GB):  set QUICK=1  before the line above.
+# Downloads ~1 GB (llama.cpp Vulkan build 38 MB + 1 GB model). Quick mode (0.5 GB model): set QUICK=1 first.
 $SelfUrl = 'https://raw.githubusercontent.com/solidfox/pc/main/z.ps1'
 $ErrorActionPreference = 'Continue'; $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
@@ -17,44 +17,12 @@ function Step($name,[scriptblock]$b){ Hdr $name; try { & $b } catch { [void]$Fai
 function Num($s){ $d=0.0; if([double]::TryParse(("$s" -replace '[^\d\.\-]',''),[Globalization.NumberStyles]::Float,$Inv,[ref]$d)){ $d } else { $null } }
 function Events($filter){ try { ,@(Get-WinEvent -FilterHashtable $filter -ErrorAction Stop) } catch { if($_.FullyQualifiedErrorId -match 'NoMatchingEventsFound' -or $_.Exception.Message -match 'No events were found'){ ,@() } else { $null } } }
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if(-not $isAdmin){ V 'WARN' 'Not running as Administrator: disk health and some logs may be missing. Re-run from an admin cmd for full results.' }
+if(-not $isAdmin){ V 'WARN' 'Not running as Administrator: the NVIDIA driver log may be unreadable. Re-run from an admin cmd for full results.' }
 $Start = Get-Date
 
-Step 'System' {
-  $cs=Get-CimInstance Win32_ComputerSystem; $bios=Get-CimInstance Win32_BIOS; $os=Get-CimInstance Win32_OperatingSystem
-  "  Model: $($cs.Manufacturer) $($cs.Model)   Serial: $($bios.SerialNumber)   BIOS: $($bios.SMBIOSBIOSVersion)"
-  "  OS: $($os.Caption) $($os.Version)   Uptime: $([int]((Get-Date)-$os.LastBootUpTime).TotalHours) h"
-  Get-CimInstance Win32_Processor | % { "  CPU: $($_.Name)  Cores/Threads: $($_.NumberOfCores)/$($_.NumberOfLogicalProcessors)" }
-}
-
-Step 'Memory (expect 4x16 GB ECC Registered)' {
-  $dimms=@(Get-CimInstance Win32_PhysicalMemory)
-  foreach($d in $dimms){ "  {0,-14} {1,3} GB  {2} MT/s  {3}  {4}" -f $d.DeviceLocator,($d.Capacity/1GB),$d.Speed,$d.Manufacturer,("$($d.PartNumber)".Trim()) }
-  $tot=($dimms|Measure-Object Capacity -Sum).Sum/1GB; "  Total: $tot GB in $($dimms.Count) modules"
-  if($tot -ge 63){ V 'PASS' "$tot GB RAM" } else { V 'FAIL' "Only $tot GB RAM (advertised 64)" }
-  $arr=@(Get-CimInstance Win32_PhysicalMemoryArray | ? { $_.Use -eq 3 -or $_.Use -eq $null })
-  $codes=$arr | % { [int]$_.MemoryErrorCorrection }
-  if($codes | ? { $_ -eq 5 -or $_ -eq 6 }){ V 'PASS' 'Firmware reports ECC memory (capability, not proof it is error-free)' }
-  else { V 'WARN' "Firmware does not report ECC (code(s): $($codes -join ','))" }
-}
-
-Step 'Hardware error history (last 90 days)' {
-  $since=(Get-Date).AddDays(-90)
-  $whea=Events @{LogName='System';ProviderName='Microsoft-Windows-WHEA-Logger';StartTime=$since}
-  if($null -eq $whea){ V 'WARN' 'Could not read WHEA log' } elseif($whea.Count){ V 'FAIL' "$($whea.Count) WHEA hardware errors (CPU/RAM/PCIe)"; $whea|Select -First 8|%{ "    $($_.TimeCreated) id $($_.Id) $(("$($_.Message)" -split "`n")[0])" } } else { V 'PASS' 'No WHEA hardware errors' }
-  $cr=Events @{LogName='System';Id=41,1001,6008;StartTime=$since}
-  if($null -eq $cr){ V 'WARN' 'Could not read crash events' } elseif($cr.Count){ V 'WARN' "$($cr.Count) unexpected shutdown/bluescreen events (power cuts also count)"; $cr|Select -First 5|%{ "    $($_.TimeCreated) id $($_.Id) $($_.ProviderName)" } } else { V 'PASS' 'No crashes or unexpected shutdowns' }
-  $nv=Events @{LogName='System';ProviderName='nvlddmkm';StartTime=$since}
+Step 'NVIDIA driver error history (last 90 days)' {
+  $nv=Events @{LogName='System';ProviderName='nvlddmkm';StartTime=(Get-Date).AddDays(-90)}
   if($null -eq $nv){ V 'WARN' 'Could not read NVIDIA driver log' } elseif($nv.Count){ V 'WARN' "$($nv.Count) NVIDIA driver errors in the past (TDR/Xid)"; $nv|Select -First 5|%{ "    $($_.TimeCreated) $(("$($_.Message)" -split "`n")[0])" } } else { V 'PASS' 'No NVIDIA driver errors' }
-}
-
-Step 'Disks' {
-  foreach($pd in @(Get-PhysicalDisk)){
-    $r=$pd|Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
-    "  $($pd.FriendlyName)  $([math]::Round($pd.Size/1GB)) GB  Health: $($pd.HealthStatus)  Wear: $($r.Wear)%  Temp: $($r.Temperature)C  PowerOnHours: $($r.PowerOnHours)  ReadErr: $($r.ReadErrorsTotal)  WriteErr: $($r.WriteErrorsTotal)"
-    if($pd.HealthStatus -eq 'Healthy'){ V 'PASS' "$($pd.FriendlyName) healthy" } else { V 'FAIL' "$($pd.FriendlyName) health: $($pd.HealthStatus)" }
-    if($r -and $r.Wear -ne $null -and $r.Wear -ge 50){ V 'WARN' "$($pd.FriendlyName) wear $($r.Wear)%" }
-  }
 }
 
 $smi=$null
@@ -71,37 +39,27 @@ Step 'GPU info' {
 }
 
 $bench=$null; $model=$null
-Step 'Download llama.cpp (CUDA) and test model' {
+Step 'Download GPU stress tool (llama.cpp Vulkan) and small test model' {
   if(-not $smi){ throw 'skipped: no nvidia-smi' }
-  $L=Join-Path $W 'llama'
+  $L=Join-Path $W 'llamavk'
   $script:bench=Get-ChildItem $L -Recurse -Filter llama-bench.exe -ErrorAction SilentlyContinue | Select -First 1
-  if($script:bench -and -not (Test-Path (Join-Path $script:bench.DirectoryName 'cudart64_*.dll'))){ $script:bench=$null }  # earlier run aborted before cudart
+  if($script:bench -and -not (Test-Path (Join-Path $script:bench.DirectoryName 'ggml-vulkan*.dll'))){ $script:bench=$null }
   if(-not $script:bench){
     $rels=Invoke-RestMethod 'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30' -Headers @{'User-Agent'='pccheck'}
-    # Prefer CUDA 12.4 (oldest driver requirement); fall back to any 12.x build with a matching cudart zip
-    $rel=$null; $bin=$null; $rt=$null
-    foreach($r in $rels){
-      foreach($b in @($r.assets | ? { $_.name -match '^llama-.*-bin-win-cuda-12\.\d+-x64\.zip$' } | Sort-Object { $_.name -notmatch 'cuda-12\.4-' }, name)){
-        $cv=[regex]::Match($b.name,'cuda-12\.\d+').Value
-        $c=$r.assets | ? { $_.name -match ('^cudart-.*win-' + [regex]::Escape($cv) + '-x64\.zip$') } | Select -First 1
-        if($c){ $rel=$r; $bin=$b; $rt=$c; break }
-      }
-      if($rel){ break }
-    }
-    if(-not $rel){ throw 'No llama.cpp release with CUDA 12.x Windows binaries found' }
+    $bin=$null; foreach($r in $rels){ $bin=$r.assets | ? { $_.name -match '^llama-.*-bin-win-vulkan-x64\.zip$' } | Select -First 1; if($bin){ break } }
+    if(-not $bin){ throw 'No llama.cpp release with a Windows Vulkan build found' }
     New-Item -ItemType Directory -Force $L | Out-Null
-    foreach($a in $bin,$rt){ $z=Join-Path $W $a.name; "  $($a.name) ($([int]($a.size/1MB)) MB)"
-      & curl.exe -L --fail -s -S -o $z $a.browser_download_url; if($LASTEXITCODE -ne 0){ throw "download failed: $($a.name)" }
-      Expand-Archive $z -DestinationPath $L -Force }
+    $z=Join-Path $W $bin.name; "  $($bin.name) ($([int]($bin.size/1MB)) MB)"
+    & curl.exe -L --fail -s -S -o $z $bin.browser_download_url; if($LASTEXITCODE -ne 0){ throw "download failed: $($bin.name)" }
+    Expand-Archive $z -DestinationPath $L -Force
     $script:bench=Get-ChildItem $L -Recurse -Filter llama-bench.exe | Select -First 1
     if(-not $script:bench){ throw 'llama-bench.exe not in archive' }
-    Get-ChildItem $L -Recurse -Filter 'cu*.dll' | ? { $_.DirectoryName -ne $script:bench.DirectoryName } | Copy-Item -Destination $script:bench.DirectoryName -Force
   }
-  if($env:QUICK -eq '1'){ $u='https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf' }
-  else { $u='https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf' }
+  if($env:QUICK -eq '1'){ $u='https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q8_0.gguf' }
+  else { $u='https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf' }
   $m=Join-Path $W (Split-Path $u -Leaf)
   if(-not (Test-Path $m)){
-    "  model $(Split-Path $u -Leaf) (2-5 GB)..."; $t=Get-Date
+    "  model $(Split-Path $u -Leaf) (0.5-1 GB)..."; $t=Get-Date
     & curl.exe -L --fail -S -# -o "$m.part" $u
     if($LASTEXITCODE -ne 0){ Remove-Item "$m.part" -ErrorAction SilentlyContinue; throw 'model download failed' }
     $fs=[IO.File]::OpenRead("$m.part"); $hdr=New-Object byte[] 4; [void]$fs.Read($hdr,0,4); $fs.Close()
@@ -136,7 +94,7 @@ Step 'GPU load test (about 6 minutes)' {
     "  Warm-up benchmark:"; RunBench @('-m',"`"$model`"",'-ngl','99','-p','512','-n','128','-r','3') 300 | Write-Host
     $end=(Get-Date).AddMinutes(4)
     while((Get-Date) -lt $end){
-      [void](RunBench @('-m',"`"$model`"",'-ngl','99','-p','4096','-n','0','-r','20') 240)
+      [void](RunBench @('-m',"`"$model`"",'-ngl','99','-p','4096','-n','0','-ub','2048','-r','30') 240)
       $last=Get-Content $csv -Tail 1 -ErrorAction SilentlyContinue
       if($last){ $v=$last -split ','; $h=@{}; for($i=0;$i -lt $ok.Count -and $i -lt $v.Count;$i++){ $h[$ok[$i]]=$v[$i].Trim() }
         "  temp $($h['temperature.gpu'])C  util $($h['utilization.gpu'])%  power $($h['power.draw'])W  sm $($h['clocks.sm'])MHz  fan $($h['fan.speed'])%" }
@@ -166,12 +124,11 @@ Step 'GPU load summary' {
   if($thr.Count -and -not ($thr|?{ $c=$_; @($rows|?{ $_[$c] -eq 'Active' }).Count })){ V 'PASS' 'No throttling or power-brake events' }
   $nv2=Events @{LogName='System';ProviderName='nvlddmkm';StartTime=$TestStart}
   if($null -eq $nv2){ V 'WARN' 'Could not read NVIDIA log after test' } elseif($nv2.Count){ V 'FAIL' "NVIDIA driver errors during test: $($nv2.Count)" } else { V 'PASS' 'No driver errors during test' }
-  "  Reference: healthy 3090 ~ 100-130 tok/s generation (tg128) on 7B Q4_K_M; ~3000+ tok/s prompt (pp512)."
 }
 
 Hdr 'VERDICT'
 foreach($l in 'FAIL','WARN','PASS'){ $Verdicts | ? { $_.L -eq $l } | % { Write-Host "  [$l] $($_.M)" -ForegroundColor (@{PASS='Green';WARN='Yellow';FAIL='Red'}[$l]) } }
-"  Note: this is health/inventory plus a GPU workload, not a full RAM or VRAM memory test; GPU core temp does not show GDDR6X memory temperature."
+"  Note: GPU-only check (RAM, disks and CPU not tested). Sustained GPU compute load, not a full VRAM memory test; core temp does not show GDDR6X memory temperature."
 if($Failures.Count){ "`n  Checks that crashed:"; $Failures | % { "   - $_" } }
 try { Stop-Transcript | Out-Null } catch {}
 Write-Host "`nReport: $Log" -ForegroundColor Cyan
@@ -189,7 +146,7 @@ if($Failures.Count){
     if(-not $claude){ Write-Host 'Claude Code install failed.' -ForegroundColor Red }
     else {
       $fl=Join-Path $W 'failures.txt'; $Failures | Set-Content $fl
-      $prompt="I'm testing a used PC (RTX 3090 workstation) before buying it. The check script $W\z.ps1 (source: $SelfUrl) ran and some checks crashed; failures are in $fl and the full report is $Log. Diagnose why those checks failed, fix the test code (not drivers, BIOS or hardware settings), and re-run only the failed checks. Summarize the hardware results plainly at the end."
+      $prompt="I'm testing the RTX 3090 in a used PC before buying it (GPU-only check). The check script $W\z.ps1 (source: $SelfUrl) ran and some checks crashed; failures are in $fl and the full report is $Log. Diagnose why those checks failed, fix the test code (not drivers, BIOS or hardware settings), and re-run only the failed checks. Summarize the hardware results plainly at the end."
       Push-Location $W; & $claude $prompt; Pop-Location
       Write-Host "`nWhen done: type /logout inside Claude before quitting (or delete $env:USERPROFILE\.claude and $env:USERPROFILE\.claude.json) so your login isn't left on this PC." -ForegroundColor Yellow
     }
