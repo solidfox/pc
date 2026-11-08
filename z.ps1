@@ -1,5 +1,5 @@
 # Used-PC check for an RTX 3090 workstation. Run from an ADMINISTRATOR cmd:
-#   powershell -NoProfile -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/solidfox/pc/main/z.ps1|iex"
+#   powershell "irm https://is.gd/pcz440|iex"      (in PowerShell: irm https://is.gd/pcz440|iex)
 # Quick mode (2 GB model instead of 4.7 GB):  set QUICK=1  before the line above.
 $SelfUrl = 'https://raw.githubusercontent.com/solidfox/pc/main/z.ps1'
 $ErrorActionPreference = 'Continue'; $ProgressPreference = 'SilentlyContinue'
