@@ -1,5 +1,5 @@
 # GPU-only check for a used RTX 3090 (stability, thermals, throttling, driver errors). Run from an ADMINISTRATOR cmd:
-#   powershell "irm https://is.gd/pcz440|iex"      (in PowerShell: irm https://is.gd/pcz440|iex)
+#   powershell "irm test.schlaug.com|iex"   (backup: powershell "irm https://is.gd/pcz440|iex"). No NVIDIA driver? It offers to install the latest Game Ready driver (~1 GB).
 # Full 24 GB VRAM test (memtest_vulkan, 0.6 MB) + compute load (llama.cpp Vulkan 38 MB + 1 GB model). ~9 min. Quick mode (0.5 GB model): set QUICK=1 first.
 $SelfUrl = 'https://raw.githubusercontent.com/solidfox/pc/main/z.ps1'
 $ErrorActionPreference = 'Continue'; $ProgressPreference = 'SilentlyContinue'
@@ -33,7 +33,29 @@ Step 'GPU info' {
   $script:smi=(Get-Command nvidia-smi -ErrorAction SilentlyContinue).Source
   if(-not $script:smi){ foreach($p in "$env:WINDIR\System32\nvidia-smi.exe","C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"){ if(Test-Path $p){ $script:smi=$p } } }
   if(-not $script:smi){ $script:smi=(Get-ChildItem "$env:WINDIR\System32\DriverStore\FileRepository\nv*\nvidia-smi.exe" -ErrorAction SilentlyContinue | Select -First 1).FullName }
-  if(-not $script:smi){ throw 'nvidia-smi not found (NVIDIA driver missing?)' }
+  if(-not $script:smi){
+    $nvdev=@(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | ? { $_.PNPDeviceID -like 'PCI\VEN_10DE*' -and ($_.PNPClass -eq 'Display' -or $_.Name -match 'VGA|Video|Display|NVIDIA|GeForce|3D') })
+    if(-not $nvdev.Count){ V 'FAIL' 'No NVIDIA graphics card detected on the PCI bus (card missing, not seated, or not powered)'; throw 'no NVIDIA GPU detected' }
+    "  NVIDIA card present ($($nvdev[0].Name)) but no NVIDIA driver installed."
+    $a=Read-Host '  Download (~1 GB) and silently install the latest NVIDIA Game Ready driver now? (y/N)'
+    if($a -notmatch '^(y|j)'){ throw 'nvidia-smi not found (NVIDIA driver missing; install declined)' }
+    $q='https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php?func=DriverManualLookup&psid=120&pfid=930&osID=57&languageCode=1033&beta=0&isWHQL=1&dltype=-1&dch=1&upCRD=0&qnf=0&sort1=0&numberOfResults=1'
+    $di=(Invoke-RestMethod $q -Headers @{'User-Agent'='pccheck'}).IDS[0].downloadInfo
+    if(-not $di.DownloadURL -or $di.DownloadURL -notmatch '^https://[a-z0-9\.]*nvidia\.com/'){ throw 'Could not look up the NVIDIA driver download' }
+    $de=Join-Path $W (Split-Path $di.DownloadURL -Leaf)
+    "  Driver $($di.Version) ($($di.DownloadURLFileSize)) from $($di.DownloadURL)"
+    if(-not (Test-Path $de)){ & curl.exe -L --fail -S -# -o "$de.part" $di.DownloadURL; if($LASTEXITCODE -ne 0){ Remove-Item "$de.part" -ErrorAction SilentlyContinue; throw 'driver download failed' }; Move-Item "$de.part" $de -Force }
+    $sig=Get-AuthenticodeSignature $de
+    if($sig.Status -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch 'NVIDIA'){ throw "driver installer signature not valid/NVIDIA ($($sig.Status))" }
+    "  Installing silently (a few minutes; the screen may flicker)..."
+    $ip=Start-Process $de -ArgumentList '-s','-noreboot','-noeula','-clean' -PassThru -Wait
+    "  Installer exit code $($ip.ExitCode)"
+    foreach($p in "$env:WINDIR\System32\nvidia-smi.exe","C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"){ if(Test-Path $p){ $script:smi=$p } }
+    if(-not $script:smi){ $script:smi=(Get-ChildItem "$env:WINDIR\System32\DriverStore\FileRepository\nv*\nvidia-smi.exe" -ErrorAction SilentlyContinue | Select -First 1).FullName }
+    if(-not $script:smi){ throw "driver installed (exit $($ip.ExitCode)) but nvidia-smi still missing - reboot and run the one-liner again" }
+    & $script:smi -L | Out-Null; if($LASTEXITCODE -ne 0){ throw 'driver installed but the GPU is not responding yet - reboot and run the one-liner again' }
+    V 'PASS' "Installed NVIDIA driver $($di.Version)"
+  }
   & $script:smi -i 0 --query-gpu=name,vbios_version,driver_version,memory.total,pcie.link.gen.max,pcie.link.width.max,power.limit,temperature.gpu,fan.speed --format=csv
   $g=(& $script:smi -i 0 --query-gpu=name,memory.total --format=csv,noheader,nounits) -split ','
   if($LASTEXITCODE -ne 0){ throw "nvidia-smi exit $LASTEXITCODE" }
