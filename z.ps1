@@ -23,6 +23,9 @@ $Start = Get-Date
 Step 'NVIDIA driver error history (last 90 days)' {
   $nv=Events @{LogName='System';ProviderName='nvlddmkm';StartTime=(Get-Date).AddDays(-90)}
   if($null -eq $nv){ V 'WARN' 'Could not read NVIDIA driver log' } elseif($nv.Count){ V 'WARN' "$($nv.Count) NVIDIA driver errors in the past (TDR/Xid)"; $nv|Select -First 5|%{ "    $($_.TimeCreated) $(("$($_.Message)" -split "`n")[0])" } } else { V 'PASS' 'No NVIDIA driver errors' }
+  # TDR recoveries are logged by the 'Display' provider (event 4101), not nvlddmkm
+  $td=Events @{LogName='System';ProviderName='Display';Id=4101;StartTime=(Get-Date).AddDays(-90)}
+  if($td){ $td=@($td|?{ "$($_.Message)" -match 'nvlddmkm' }); if($td.Count){ V 'WARN' "$($td.Count) NVIDIA driver timeouts/recoveries in the past (TDR, event 4101)"; $td|Select -First 3|%{ "    $($_.TimeCreated)" } } }
 }
 
 $smi=$null
@@ -96,7 +99,7 @@ $csv=Join-Path $W 'gpu-log.csv'; $mon=$null; $TestStart=$null; $cols=@()
 Remove-Item $csv -ErrorAction SilentlyContinue  # a stale log from an earlier run must not be summarised if the test is skipped
 Step 'GPU test: full VRAM (~5 min) then compute load (~3 min)' {
   if(-not $mtv -and (-not $bench -or -not $model)){ throw 'skipped: test tools unavailable (GPU info above still valid)' }
-  $fields='timestamp','temperature.gpu','utilization.gpu','power.draw','clocks.sm','fan.speed','memory.used','pcie.link.gen.current','pcie.link.width.current'
+  $fields='timestamp','temperature.gpu','utilization.gpu','power.draw','clocks.sm','clocks.mem','fan.speed','memory.used','pcie.link.gen.current','pcie.link.width.current'
   $tr=$null; foreach($pre in 'clocks_event_reasons','clocks_throttle_reasons'){ & $smi -i 0 --query-gpu="$pre.active" --format=csv,noheader 2>$null | Out-Null; if($LASTEXITCODE -eq 0){ $tr=$pre; break } }
   $ok=@(); foreach($f in $fields){ & $smi -i 0 --query-gpu=$f --format=csv,noheader 2>$null | Out-Null; if($LASTEXITCODE -eq 0){ $ok+=$f } }
   if($tr){ foreach($s in 'hw_slowdown','sw_thermal_slowdown','hw_thermal_slowdown','hw_power_brake_slowdown'){ & $smi -i 0 --query-gpu="$tr.$s" --format=csv,noheader 2>$null | Out-Null; if($LASTEXITCODE -eq 0){ $ok+="$tr.$s" } } }
@@ -112,7 +115,7 @@ Step 'GPU test: full VRAM (~5 min) then compute load (~3 min)' {
       $mEnd=(Get-Date).AddSeconds(420); $mt=''
       while((Get-Date) -lt $mEnd){
         Start-Sleep 10; $mt=(Get-Content $mo -Raw -ErrorAction SilentlyContinue) + (Get-Content (Join-Path $W 'memtest_vulkan.log') -Raw -ErrorAction SilentlyContinue)
-        if($mt -match 'Standard 5-minute test (PASSed|fail)' -or $mt -match 'testing finished|testing PASSed|INIT OR FIRST testing failed|runtime error occured'){ break }
+        if($mt -match 'Standard 5-minute test (PASSed|fail)|Error found' -or $mt -match 'testing finished|testing PASSed|INIT OR FIRST testing failed|runtime error occured'){ break }
         if($mp.HasExited -and -not (Get-Process memtest_vulkan* -ErrorAction SilentlyContinue)){ break }
       }
       Get-Process memtest_vulkan* -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -121,7 +124,7 @@ Step 'GPU test: full VRAM (~5 min) then compute load (~3 min)' {
       if($gb){ "  Tested $gb GB of VRAM" }
       ($mt -split "`n" | ? { $_ -match 'written:|Error found|Errors address|Standard 5-minute' } | Select -Last 4) | % { "    $($_.Trim())" }
       if($mt -match 'ERRORS FOUND|Error found'){ V 'FAIL' 'VRAM errors found by memtest_vulkan (faulty memory or overheating VRAM)' }
-      elseif($mt -match 'Standard 5-minute test PASSed'){ if($gb -and $gb -lt 20){ V 'WARN' "VRAM test passed but covered only $gb GB" } else { V 'PASS' "VRAM test passed ($gb GB written and verified, no errors)" } }
+      elseif($mt -match 'Standard 5-minute test PASSed'){ if($gb -and $gb -lt 20){ V 'WARN' "VRAM test passed but covered only $gb GB" } elseif($gb){ V 'PASS' "VRAM test passed ($gb GB written and verified, no errors)" } else { V 'PASS' 'VRAM test passed (no errors)' } }
       else { [void]$Failures.Add("VRAM test: did not complete. Output tail: $((($mt -split "`n") | Select -Last 5) -join ' | ')"); V 'WARN' 'VRAM test did not complete (see output above)' }
     }
     if(-not $bench -or -not $model){ throw 'compute load skipped: llama.cpp tools unavailable' }
@@ -131,7 +134,7 @@ Step 'GPU test: full VRAM (~5 min) then compute load (~3 min)' {
       [void](RunBench @('-m',"`"$model`"",'-ngl','99','-p','4096','-n','0','-ub','2048','-r','30') 240)
       $last=Get-Content $csv -Tail 1 -ErrorAction SilentlyContinue
       if($last){ $v=$last -split ','; $h=@{}; for($i=0;$i -lt $ok.Count -and $i -lt $v.Count;$i++){ $h[$ok[$i]]=$v[$i].Trim() }
-        "  temp $($h['temperature.gpu'])C  util $($h['utilization.gpu'])%  power $($h['power.draw'])W  sm $($h['clocks.sm'])MHz  fan $($h['fan.speed'])%" }
+        "  temp $($h['temperature.gpu'])C  util $($h['utilization.gpu'])%  power $($h['power.draw'])W  sm $($h['clocks.sm'])MHz  mem $($h['clocks.mem'])MHz  fan $($h['fan.speed'])%" }
     }
     "  Hot benchmark:"; RunBench @('-m',"`"$model`"",'-ngl','99','-p','512','-n','128','-r','3') 300 | Write-Host
   } finally { if($script:mon){ try{ Stop-Process $script:mon -Force }catch{} }; Start-Sleep 1 }
@@ -149,6 +152,10 @@ Step 'GPU load summary' {
   "  Max core temp: $mt C   Max power: $mp W   Avg SM clock under load: $([int]$sm) MHz"
   if($mt -eq $null){ V 'WARN' 'No temperature data' } elseif($mt -ge 87){ V 'FAIL' "Hot: $mt C core (repaste/pads likely)" } elseif($mt -ge 83){ V 'WARN' "Warm: $mt C core (normal-ish for OEM blower)" } else { V 'PASS' "Core temp OK ($mt C)" }
   if($mp -ne $null -and $mp -lt 250){ V 'WARN' "Peak power only $mp W - may be power-limited" }
+  # No GDDR6X temp in nvidia-smi; an overheating GDDR6X shows up as the memory clock dropping under load
+  $mc=@($busy|%{ Num $_['clocks.mem'] }|?{ $_ -ne $null })
+  if($mc.Count){ $mx=($mc|Measure-Object -Maximum).Maximum; $low=@($mc|?{ $_ -lt 0.85*$mx }).Count
+    if($low -ge 3){ V 'WARN' "Memory clock fell below 85% of $mx MHz in $low loaded samples (possible hot GDDR6X throttling)" } else { V 'PASS' "Memory clock steady under load ($mx MHz)" } }
   $w=$busy|%{ Num $_['pcie.link.width.current'] }|?{ $_ -ne $null }|Select -First 1
   $gn=$busy|%{ $_['pcie.link.gen.current'] }|Select -First 1
   if($w -eq $null){ V 'WARN' 'PCIe width unknown' } elseif($w -lt 16){ V 'FAIL' "PCIe link x$w (should be x16)" } else { V 'PASS' "PCIe gen $gn x$w" }
@@ -158,11 +165,13 @@ Step 'GPU load summary' {
   if($thr.Count -and -not ($thr|?{ $c=$_; @($rows|?{ $_[$c] -eq 'Active' }).Count })){ V 'PASS' 'No throttling or power-brake events' }
   $nv2=Events @{LogName='System';ProviderName='nvlddmkm';StartTime=$TestStart}
   if($null -eq $nv2){ V 'WARN' 'Could not read NVIDIA log after test' } elseif($nv2.Count){ V 'FAIL' "NVIDIA driver errors during test: $($nv2.Count)" } else { V 'PASS' 'No driver errors during test' }
+  $td2=Events @{LogName='System';ProviderName='Display';Id=4101;StartTime=$TestStart}
+  if($td2){ $td2=@($td2|?{ "$($_.Message)" -match 'nvlddmkm' }); if($td2.Count){ V 'FAIL' "NVIDIA driver timed out and recovered during test (TDR) $($td2.Count)x" } }
 }
 
 Hdr 'VERDICT'
 foreach($l in 'FAIL','WARN','PASS'){ $Verdicts | ? { $_.L -eq $l } | % { Write-Host "  [$l] $($_.M)" -ForegroundColor (@{PASS='Green';WARN='Yellow';FAIL='Red'}[$l]) } }
-"  Note: GPU-only check (RAM, disks and CPU not tested). Full VRAM write/verify (memtest_vulkan) plus sustained compute load; core temp does not show GDDR6X memory temperature."
+"  Note: GPU-only check (RAM, disks and CPU not tested). Full VRAM write/verify (memtest_vulkan) plus sustained compute load; core temp does not show GDDR6X memory temperature (memory-clock drops are flagged instead)."
 if($Failures.Count){ "`n  Checks that crashed:"; $Failures | % { "   - $_" } }
 try { Stop-Transcript | Out-Null } catch {}
 Write-Host "`nReport: $Log" -ForegroundColor Cyan
