@@ -15,7 +15,7 @@ function Hdr($t){ Write-Host "`n==== $t ====" -ForegroundColor Cyan }
 function V($lvl,$msg){ [void]$Verdicts.Add([pscustomobject]@{L=$lvl;M=$msg}); $c=@{PASS='Green';WARN='Yellow';FAIL='Red'}[$lvl]; Write-Host "  [$lvl] $msg" -ForegroundColor $c }
 function Step($name,[scriptblock]$b){ Hdr $name; try { & $b } catch { [void]$Failures.Add("${name}: $($_.Exception.Message)"); V 'WARN' "Check '$name' crashed: $($_.Exception.Message)" } }
 function Num($s){ $d=0.0; if([double]::TryParse(("$s" -replace '[^\d\.\-]',''),[Globalization.NumberStyles]::Float,$Inv,[ref]$d)){ $d } else { $null } }
-function Events($filter){ try { @(Get-WinEvent -FilterHashtable $filter -ErrorAction Stop) } catch { if($_.Exception.Message -match 'No events were found'){ @() } else { $null } } }
+function Events($filter){ try { ,@(Get-WinEvent -FilterHashtable $filter -ErrorAction Stop) } catch { if($_.FullyQualifiedErrorId -match 'NoMatchingEventsFound' -or $_.Exception.Message -match 'No events were found'){ ,@() } else { $null } } }
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if(-not $isAdmin){ V 'WARN' 'Not running as Administrator: disk health and some logs may be missing. Re-run from an admin cmd for full results.' }
 $Start = Get-Date
@@ -41,11 +41,11 @@ Step 'Memory (expect 4x16 GB ECC Registered)' {
 Step 'Hardware error history (last 90 days)' {
   $since=(Get-Date).AddDays(-90)
   $whea=Events @{LogName='System';ProviderName='Microsoft-Windows-WHEA-Logger';StartTime=$since}
-  if($whea -eq $null){ V 'WARN' 'Could not read WHEA log' } elseif($whea.Count){ V 'FAIL' "$($whea.Count) WHEA hardware errors (CPU/RAM/PCIe)"; $whea|Select -First 8|%{ "    $($_.TimeCreated) id $($_.Id) $(("$($_.Message)" -split "`n")[0])" } } else { V 'PASS' 'No WHEA hardware errors' }
+  if($null -eq $whea){ V 'WARN' 'Could not read WHEA log' } elseif($whea.Count){ V 'FAIL' "$($whea.Count) WHEA hardware errors (CPU/RAM/PCIe)"; $whea|Select -First 8|%{ "    $($_.TimeCreated) id $($_.Id) $(("$($_.Message)" -split "`n")[0])" } } else { V 'PASS' 'No WHEA hardware errors' }
   $cr=Events @{LogName='System';Id=41,1001,6008;StartTime=$since}
-  if($cr -eq $null){ V 'WARN' 'Could not read crash events' } elseif($cr.Count){ V 'WARN' "$($cr.Count) unexpected shutdown/bluescreen events (power cuts also count)"; $cr|Select -First 5|%{ "    $($_.TimeCreated) id $($_.Id) $($_.ProviderName)" } } else { V 'PASS' 'No crashes or unexpected shutdowns' }
+  if($null -eq $cr){ V 'WARN' 'Could not read crash events' } elseif($cr.Count){ V 'WARN' "$($cr.Count) unexpected shutdown/bluescreen events (power cuts also count)"; $cr|Select -First 5|%{ "    $($_.TimeCreated) id $($_.Id) $($_.ProviderName)" } } else { V 'PASS' 'No crashes or unexpected shutdowns' }
   $nv=Events @{LogName='System';ProviderName='nvlddmkm';StartTime=$since}
-  if($nv -eq $null){ V 'WARN' 'Could not read NVIDIA driver log' } elseif($nv.Count){ V 'WARN' "$($nv.Count) NVIDIA driver errors in the past (TDR/Xid)"; $nv|Select -First 5|%{ "    $($_.TimeCreated) $(("$($_.Message)" -split "`n")[0])" } } else { V 'PASS' 'No NVIDIA driver errors' }
+  if($null -eq $nv){ V 'WARN' 'Could not read NVIDIA driver log' } elseif($nv.Count){ V 'WARN' "$($nv.Count) NVIDIA driver errors in the past (TDR/Xid)"; $nv|Select -First 5|%{ "    $($_.TimeCreated) $(("$($_.Message)" -split "`n")[0])" } } else { V 'PASS' 'No NVIDIA driver errors' }
 }
 
 Step 'Disks' {
@@ -61,6 +61,7 @@ $smi=$null
 Step 'GPU info' {
   $script:smi=(Get-Command nvidia-smi -ErrorAction SilentlyContinue).Source
   if(-not $script:smi){ foreach($p in "$env:WINDIR\System32\nvidia-smi.exe","C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"){ if(Test-Path $p){ $script:smi=$p } } }
+  if(-not $script:smi){ $script:smi=(Get-ChildItem "$env:WINDIR\System32\DriverStore\FileRepository\nv*\nvidia-smi.exe" -ErrorAction SilentlyContinue | Select -First 1).FullName }
   if(-not $script:smi){ throw 'nvidia-smi not found (NVIDIA driver missing?)' }
   & $script:smi -i 0 --query-gpu=name,vbios_version,driver_version,memory.total,pcie.link.gen.max,pcie.link.width.max,power.limit,temperature.gpu,fan.speed --format=csv
   $g=(& $script:smi -i 0 --query-gpu=name,memory.total --format=csv,noheader,nounits) -split ','
@@ -74,12 +75,20 @@ Step 'Download llama.cpp (CUDA) and test model' {
   if(-not $smi){ throw 'skipped: no nvidia-smi' }
   $L=Join-Path $W 'llama'
   $script:bench=Get-ChildItem $L -Recurse -Filter llama-bench.exe -ErrorAction SilentlyContinue | Select -First 1
+  if($script:bench -and -not (Test-Path (Join-Path $script:bench.DirectoryName 'cudart64_*.dll'))){ $script:bench=$null }  # earlier run aborted before cudart
   if(-not $script:bench){
     $rels=Invoke-RestMethod 'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30' -Headers @{'User-Agent'='pccheck'}
-    $rel=$rels | ? { ($_.assets.name -match '^llama-.*-bin-win-cuda-12\.4-x64\.zip$') -and ($_.assets.name -match '^cudart-.*win-cuda-12\.4-x64\.zip$') } | Select -First 1
-    if(-not $rel){ throw 'No llama.cpp release with CUDA 12.4 Windows binaries found' }
-    $bin=$rel.assets|?{ $_.name -match '^llama-.*-bin-win-cuda-12\.4-x64\.zip$' }|Select -First 1
-    $rt=$rel.assets|?{ $_.name -match '^cudart-.*win-cuda-12\.4-x64\.zip$' }|Select -First 1
+    # Prefer CUDA 12.4 (oldest driver requirement); fall back to any 12.x build with a matching cudart zip
+    $rel=$null; $bin=$null; $rt=$null
+    foreach($r in $rels){
+      foreach($b in @($r.assets | ? { $_.name -match '^llama-.*-bin-win-cuda-12\.\d+-x64\.zip$' } | Sort-Object { $_.name -notmatch 'cuda-12\.4-' }, name)){
+        $cv=[regex]::Match($b.name,'cuda-12\.\d+').Value
+        $c=$r.assets | ? { $_.name -match ('^cudart-.*win-' + [regex]::Escape($cv) + '-x64\.zip$') } | Select -First 1
+        if($c){ $rel=$r; $bin=$b; $rt=$c; break }
+      }
+      if($rel){ break }
+    }
+    if(-not $rel){ throw 'No llama.cpp release with CUDA 12.x Windows binaries found' }
     New-Item -ItemType Directory -Force $L | Out-Null
     foreach($a in $bin,$rt){ $z=Join-Path $W $a.name; "  $($a.name) ($([int]($a.size/1MB)) MB)"
       & curl.exe -L --fail -s -S -o $z $a.browser_download_url; if($LASTEXITCODE -ne 0){ throw "download failed: $($a.name)" }
@@ -112,7 +121,8 @@ function RunBench($argList,$timeoutSec){
   $txt
 }
 
-$csv=Join-Path $W 'gpu-log.csv'; $mon=$null; $TestStart=$null
+$csv=Join-Path $W 'gpu-log.csv'; $mon=$null; $TestStart=$null; $cols=@()
+Remove-Item $csv -ErrorAction SilentlyContinue  # a stale log from an earlier run must not be summarised if the test is skipped
 Step 'GPU load test (about 6 minutes)' {
   if(-not $bench -or -not $model){ throw 'skipped: benchmark tools unavailable (GPU info above still valid)' }
   $fields='timestamp','temperature.gpu','utilization.gpu','power.draw','clocks.sm','fan.speed','memory.used','pcie.link.gen.current','pcie.link.width.current'
@@ -126,7 +136,7 @@ Step 'GPU load test (about 6 minutes)' {
     "  Warm-up benchmark:"; RunBench @('-m',"`"$model`"",'-ngl','99','-p','512','-n','128','-r','3') 300 | Write-Host
     $end=(Get-Date).AddMinutes(4)
     while((Get-Date) -lt $end){
-      [void](RunBench @('-m',"`"$model`"",'-ngl','99','-p','4096','-n','0','-r','5') 240)
+      [void](RunBench @('-m',"`"$model`"",'-ngl','99','-p','4096','-n','0','-r','20') 240)
       $last=Get-Content $csv -Tail 1 -ErrorAction SilentlyContinue
       if($last){ $v=$last -split ','; $h=@{}; for($i=0;$i -lt $ok.Count -and $i -lt $v.Count;$i++){ $h[$ok[$i]]=$v[$i].Trim() }
         "  temp $($h['temperature.gpu'])C  util $($h['utilization.gpu'])%  power $($h['power.draw'])W  sm $($h['clocks.sm'])MHz  fan $($h['fan.speed'])%" }
@@ -155,7 +165,7 @@ Step 'GPU load summary' {
   foreach($c in $thr){ $hits=@($rows|?{ $_[$c] -eq 'Active' }).Count; if($hits){ $lvl=if($c -match 'hw_'){'FAIL'}else{'WARN'}; V $lvl "$c active in $hits samples" } }
   if($thr.Count -and -not ($thr|?{ $c=$_; @($rows|?{ $_[$c] -eq 'Active' }).Count })){ V 'PASS' 'No throttling or power-brake events' }
   $nv2=Events @{LogName='System';ProviderName='nvlddmkm';StartTime=$TestStart}
-  if($nv2 -eq $null){ V 'WARN' 'Could not read NVIDIA log after test' } elseif($nv2.Count){ V 'FAIL' "NVIDIA driver errors during test: $($nv2.Count)" } else { V 'PASS' 'No driver errors during test' }
+  if($null -eq $nv2){ V 'WARN' 'Could not read NVIDIA log after test' } elseif($nv2.Count){ V 'FAIL' "NVIDIA driver errors during test: $($nv2.Count)" } else { V 'PASS' 'No driver errors during test' }
   "  Reference: healthy 3090 ~ 100-130 tok/s generation (tg128) on 7B Q4_K_M; ~3000+ tok/s prompt (pp512)."
 }
 
@@ -171,14 +181,17 @@ if($Failures.Count){
   if($a -match '^(y|j)'){
     $claude=(Get-Command claude -ErrorAction SilentlyContinue).Source
     if(-not $claude -and (Test-Path "$env:USERPROFILE\.local\bin\claude.exe")){ $claude="$env:USERPROFILE\.local\bin\claude.exe" }
-    if(-not $claude){ Write-Host 'Installing Claude Code (official installer)...'; irm https://claude.ai/install.ps1 | iex
-      $env:Path="$env:USERPROFILE\.local\bin;$env:Path"; $claude=(Get-Command claude -ErrorAction SilentlyContinue).Source }
+    if(-not $claude){ Write-Host 'Installing Claude Code (official installer)...'
+      # Child process: the installer may 'exit' or change StrictMode/ErrorActionPreference, which would kill or alter this session
+      & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm https://claude.ai/install.ps1 | iex"
+      $env:Path="$env:USERPROFILE\.local\bin;$env:Path"; $claude=(Get-Command claude -ErrorAction SilentlyContinue).Source
+      if(-not $claude -and (Test-Path "$env:USERPROFILE\.local\bin\claude.exe")){ $claude="$env:USERPROFILE\.local\bin\claude.exe" } }
     if(-not $claude){ Write-Host 'Claude Code install failed.' -ForegroundColor Red }
     else {
       $fl=Join-Path $W 'failures.txt'; $Failures | Set-Content $fl
-      $prompt="I'm testing a used PC (RTX 3090 workstation) before buying it. The check script $W\z.ps1 ran and some checks crashed; failures are in $fl and the full report is $Log. Diagnose why those checks failed, fix the test code (not drivers, BIOS or hardware settings), and re-run only the failed checks. Summarize the hardware results plainly at the end."
+      $prompt="I'm testing a used PC (RTX 3090 workstation) before buying it. The check script $W\z.ps1 (source: $SelfUrl) ran and some checks crashed; failures are in $fl and the full report is $Log. Diagnose why those checks failed, fix the test code (not drivers, BIOS or hardware settings), and re-run only the failed checks. Summarize the hardware results plainly at the end."
       Push-Location $W; & $claude $prompt; Pop-Location
-      Write-Host "`nWhen done: run 'claude /logout' (or delete $env:USERPROFILE\.claude) so your login isn't left on this PC." -ForegroundColor Yellow
+      Write-Host "`nWhen done: type /logout inside Claude before quitting (or delete $env:USERPROFILE\.claude and $env:USERPROFILE\.claude.json) so your login isn't left on this PC." -ForegroundColor Yellow
     }
   }
 }
